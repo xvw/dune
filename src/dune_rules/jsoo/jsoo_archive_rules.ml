@@ -1,64 +1,13 @@
 open Import
 open Memo.O
 
-module Library_key = struct
-  type t = Path.Build.t * string
-
-  let equal (dir_a, name_a) (dir_b, name_b) =
-    Path.Build.equal dir_a dir_b && String.equal name_a name_b
-  ;;
-
-  let hash = Tuple.T2.hash Path.Build.hash String.hash
-  let to_dyn (dir, name) = Dyn.Tuple [ Path.Build.to_dyn dir; Dyn.string name ]
-end
-
-let find_library ~expander ~dir ~lib_name =
-  Dune_load.stanzas_in_dir dir
-  >>= function
-  | None -> Memo.return None
-  | Some dune_file ->
-    let* stanzas = Dune_file.stanzas dune_file in
-    Memo.List.find_map stanzas ~f:(fun stanza ->
-      match Stanza.repr stanza with
-      | Library.T lib when String.equal (Lib_name.Local.to_string (snd lib.name)) lib_name
-        ->
-        Expander.eval_blang expander lib.enabled_if
-        >>| (function
-         | true -> Some lib
-         | false -> None)
-      | _ -> Memo.return None)
-;;
-
-let library_cctx_memo =
-  Memo.create
-    "jsoo-library-cctx"
-    ~input:(module Library_key)
-    (fun (lib_dir, lib_name) ->
-       let* sctx =
-         Context.DB.by_dir lib_dir >>| Context.name >>= Super_context.find_exn
-       in
-       let* expander = Super_context.expander sctx ~dir:lib_dir in
-       find_library ~expander ~dir:lib_dir ~lib_name
-       >>= function
-       | None -> Memo.return None
-       | Some lib ->
-         let* dir_contents = Dir_contents.get sctx ~dir:lib_dir in
-         let* scope = Scope.DB.find_by_dir lib_dir in
-         (* [compile_context] may produce rules (via [modules_rules]) as implicit
-            output. We collect and discard them here; they will be replayed by memo
-            when the library directory is loaded through [Lib_rules.rules]. *)
-         let* cctx, _cctx_rules =
-           Rules.collect (fun () ->
-             Lib_rules.compile_context
-               lib
-               ~sctx
-               ~dir_contents
-               ~expander
-               ~scope
-               ~for_:Ocaml)
-         in
-         let modes = Compilation_context.modes cctx |> Option.value_exn in
-         if modes.byte then Memo.return (Some (lib, cctx)) else Memo.return None)
+let library_cctx ~lib_dir ~lib_name =
+  Lib_rules.compile_context_in_dir ~dir:lib_dir ~lib_name ~for_:Ocaml
+  >>| function
+  | None -> None
+  | Some (lib, cctx) ->
+    let modes = Compilation_context.modes cctx |> Option.value_exn in
+    if modes.byte then Some (lib, cctx) else None
 ;;
 
 module Lib_archive_rule_key = struct
@@ -115,7 +64,7 @@ let lib_archive_rules_memo =
     "jsoo-lib-archive-rules"
     ~input:(module Lib_archive_rule_key)
     (fun { Lib_archive_rule_key.lib_dir; lib_name; config } ->
-       Memo.exec library_cctx_memo (lib_dir, lib_name)
+       library_cctx ~lib_dir ~lib_name
        >>= function
        | None -> Memo.return None
        | Some (lib, cctx) ->
@@ -158,7 +107,7 @@ let lib_archive_rules_for_dir ~dir =
   match parse_lib_archive_dir dir with
   | None -> Memo.return Not_found
   | Some (lib_dir, lib_name, None) ->
-    Memo.exec library_cctx_memo (lib_dir, lib_name)
+    library_cctx ~lib_dir ~lib_name
     >>| (function
      | None -> Not_found
      | Some _ -> Root)

@@ -314,10 +314,7 @@ let module_deps (m : Module.t) ~odoc_dir ~(dep_graphs : Dep_graph.Ml_kind.t) =
     (let open Action_builder.O in
      let+ deps =
        let graphs =
-         if Module.has m ~ml_kind:Intf then
-           dep_graphs.intf
-         else
-           dep_graphs.impl
+         if Module.has m ~ml_kind:Intf then dep_graphs.intf else dep_graphs.impl
        in
        Dep_graph.deps_of graphs m
      in
@@ -452,7 +449,21 @@ let setup_library_odoc_rules sctx (local_lib : Lib.Local.t) =
     |> Compilation_mode.Set.of_lib_mode_set
     |> Compilation_mode.Set.for_merlin
   in
-  let* cctx = Lib_rules.compile_context_of_local_lib sctx local_lib ~for_ in
+  let* cctx =
+    let lib_name =
+      Lib_info.lib_id info
+      |> Lib_id.to_local_exn
+      |> Lib_id.Local.name
+      |> Lib_name.to_string
+    in
+    Lib_rules.compile_context_in_dir ~dir:(Lib_info.src_dir info) ~lib_name ~for_
+    >>| function
+    | Some (_, cctx) -> cctx
+    | None ->
+      Code_error.raise
+        "Odoc.setup_library_odoc_rules: library stanza not found"
+        [ "lib", Lib.Local.to_dyn local_lib ]
+  in
   let obj_dir = Compilation_context.obj_dir cctx in
   let* includes =
     let+ requires = Compilation_context.requires_compile cctx in

@@ -700,40 +700,75 @@ let compile_context (lib : Library.t) ~sctx ~dir_contents ~expander ~scope ~for_
     ~for_
 ;;
 
-let compile_context_of_local_lib sctx (local_lib : Lib.Local.t) ~for_ =
-  let info = Lib.Local.info local_lib in
-  let dir = Lib_info.src_dir info in
-  let lib_id = Lib_id.to_local_exn (Lib_info.lib_id info) in
-  let src_dir = Path.Build.drop_build_context_exn dir in
-  let* lib =
-    Dune_load.stanzas_in_dir dir
-    >>= function
-    | None -> Memo.return None
-    | Some dune_file ->
-      let+ stanzas = Dune_file.stanzas dune_file in
-      List.find_map stanzas ~f:(fun stanza ->
-        match Stanza.repr stanza with
-        | Library.T lib when Lib_id.Local.equal (Library.to_lib_id ~src_dir lib) lib_id ->
-          Some lib
-        | _ -> None)
-  in
-  match lib with
-  | None ->
-    Code_error.raise
-      "Lib_rules.compile_context_of_local_lib: library stanza not found"
-      [ "lib", Lib.Local.to_dyn local_lib ]
-  | Some lib ->
-    let* dir_contents = Dir_contents.get sctx ~dir
-    and* expander = Super_context.expander sctx ~dir
-    and* scope = Scope.DB.find_by_dir dir in
-    (* [compile_context] produces the rules of the modules of the library as
-       implicit output. They belong to the directory of the library and are
-       produced again when it is loaded through [rules], so drop them. *)
-    let+ cctx, _rules =
-      Rules.collect (fun () ->
-        compile_context lib ~sctx ~dir_contents ~expander ~scope ~for_)
-    in
-    cctx
+module Library_key = struct
+  type t =
+    { dir : Path.Build.t
+    ; lib_name : string
+    ; for_ : Compilation_mode.t
+    }
+
+  let equal a b =
+    Path.Build.equal a.dir b.dir
+    && String.equal a.lib_name b.lib_name
+    && Compilation_mode.equal a.for_ b.for_
+  ;;
+
+  let hash { dir; lib_name; for_ } =
+    Tuple.T3.hash Path.Build.hash String.hash Poly.hash (dir, lib_name, for_)
+  ;;
+
+  let to_dyn { dir; lib_name; for_ } =
+    Dyn.record
+      [ "dir", Path.Build.to_dyn dir
+      ; "lib_name", Dyn.string lib_name
+      ; "for_", Compilation_mode.to_dyn for_
+      ]
+  ;;
+end
+
+let find_library ~expander ~dir ~lib_name =
+  Dune_load.stanzas_in_dir dir
+  >>= function
+  | None -> Memo.return None
+  | Some dune_file ->
+    let* stanzas = Dune_file.stanzas dune_file in
+    Memo.List.find_map stanzas ~f:(fun stanza ->
+      match Stanza.repr stanza with
+      | Library.T lib when String.equal (Lib_name.Local.to_string (snd lib.name)) lib_name
+        ->
+        Expander.eval_blang expander lib.enabled_if
+        >>| (function
+         | true -> Some lib
+         | false -> None)
+      | _ -> Memo.return None)
+;;
+
+let library_compile_context_memo =
+  Memo.create
+    "library-compile-context"
+    ~input:(module Library_key)
+    (fun { Library_key.dir; lib_name; for_ } ->
+       let* sctx = Context.DB.by_dir dir >>| Context.name >>= Super_context.find_exn in
+       let* expander = Super_context.expander sctx ~dir in
+       find_library ~expander ~dir ~lib_name
+       >>= function
+       | None -> Memo.return None
+       | Some lib ->
+         let* dir_contents = Dir_contents.get sctx ~dir
+         and* scope = Scope.DB.find_by_dir dir in
+         (* [compile_context] produces the rules of the modules of the library
+            as implicit output. They belong to the directory of the library and
+            are produced again when it is loaded through [rules], so drop
+            them. *)
+         let+ cctx, _rules =
+           Rules.collect (fun () ->
+             compile_context lib ~sctx ~dir_contents ~expander ~scope ~for_)
+         in
+         Some (lib, cctx))
+;;
+
+let compile_context_in_dir ~dir ~lib_name ~for_ =
+  Memo.exec library_compile_context_memo { Library_key.dir; lib_name; for_ }
 ;;
 
 let rules (lib : Library.t) ~sctx ~dir_contents ~expander ~scope =
